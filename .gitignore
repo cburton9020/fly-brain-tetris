@@ -1,0 +1,19 @@
+# Environment and secrets
+venv/
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+
+# Editor settings
+.vscode/
+
+# flyvis / neuprint cache and downloaded data (can be large, regenerable)
+*.h5
+*.pt
+flyvis_data/
