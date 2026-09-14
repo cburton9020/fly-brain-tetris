@@ -16,8 +16,8 @@ piece shapes, real rotation rules, and real NES scoring underneath.
 from tetris import Board, Piece, NESRandomizer, try_move, BOARD_WIDTH, BOARD_HEIGHT
 
 # How many env steps pass before the piece drops one row on its own.
-# Smaller = faster-falling, shorter episodes, faster training.
-GRAVITY_PERIOD = 4
+# Smaller = faster-falling, more pieces placed per episode.
+GRAVITY_PERIOD = 1
 
 # Action indices, in the order the readout's output will use.
 ACTION_LEFT = 0

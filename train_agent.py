@@ -9,12 +9,12 @@ The eye, flyvis's pretrained visual network, and the central brain
 connectivity all stay completely frozen throughout, exactly as before.
 Only the small readout learns.
 
-Decision frequency is still tied to gravity speed (DECISIONS_PER_ROW),
-not a fixed step count, see tetris_env.py for why that matters for
-transferring to different gravity speeds later.
+Decisions happen every fixed number of raw steps (DECISION_INTERVAL),
+independent of gravity speed.
 """
 
 import copy
+import os
 import time
 
 import torch
@@ -26,14 +26,19 @@ from central_brain import CentralBrainLayer
 from readout import ActionReadout
 
 N_PARALLEL = 64         # how many games to run simultaneously, batched together
-DECISIONS_PER_ROW = 2
+DECISION_INTERVAL = 4   # decide every this many raw steps (frames)
 FRAME_WINDOW = 3
 
-MAX_STEPS_PER_EPISODE = 200
-NUM_ITERATIONS = 15     # one iteration = one batch of N_PARALLEL parallel episodes
+MAX_STEPS_PER_EPISODE = 800
+NUM_ITERATIONS = 300    # one iteration = one batch of N_PARALLEL parallel episodes;
+                        # set high for an overnight run, safe to stop anytime given
+                        # checkpointing below, doesn't need to finish all of them
 GAMMA = 0.99
 LEARNING_RATE = 0.01
 SAVE_PATH = "readout_weights.pt"
+CHECKPOINT_EVERY = 5    # save weights every N iterations, not just at the end,
+                        # so an interrupted overnight run doesn't lose progress
+LOG_PATH = "training_log.txt"
 
 
 def compute_discounted_returns(rewards, gamma):
@@ -147,14 +152,18 @@ def main():
 
     print("Setting up the trainable readout...")
     readout = ActionReadout(central_layer.dn_types)
+    if os.path.exists(SAVE_PATH):
+        readout.load_state_dict(torch.load(SAVE_PATH))
+        print(f"Resumed readout weights from {SAVE_PATH} (found existing checkpoint).")
+    else:
+        print("No existing checkpoint found, starting from a fresh random readout.")
     optimizer = optim.Adam(readout.parameters(), lr=LEARNING_RATE)
 
     envs = [TetrisHeadlessEnv() for _ in range(N_PARALLEL)]
-    decision_interval = max(1, envs[0].gravity_period // DECISIONS_PER_ROW)
+    decision_interval = DECISION_INTERVAL
     print(
         f"Running {N_PARALLEL} games in parallel per iteration. "
-        f"Gravity period: {envs[0].gravity_period} steps/row -> deciding every "
-        f"{decision_interval} step(s) (~{DECISIONS_PER_ROW} decisions per row fallen)\n"
+        f"Deciding every {decision_interval} step(s) (frames)\n"
     )
 
     # Print detailed per-call timing was used earlier to diagnose a real
@@ -166,55 +175,73 @@ def main():
 
     print(f"Training for up to {NUM_ITERATIONS} iterations "
           f"({N_PARALLEL} parallel episodes each)...\n")
+    print(f"Progress is also being written to {LOG_PATH}, and weights are "
+          f"checkpointed to {SAVE_PATH} every {CHECKPOINT_EVERY} iterations, "
+          f"so it's safe to stop this at any time.\n")
 
-    for iteration in range(1, NUM_ITERATIONS + 1):
-        start_time = time.time()
-        log_probs_per_env, rewards_per_env, scores, network_time, central_brain_time = run_parallel_episodes(
-            envs, eye, central_layer, readout, decision_interval
-        )
-        elapsed = time.time() - start_time
+    log_file = open(LOG_PATH, "a")
+    log_file.write(f"\n--- New run: {NUM_ITERATIONS} iterations, {N_PARALLEL} parallel episodes ---\n")
+    log_file.flush()
 
-        if iteration == 1:
-            eye._debug_timing = False  # only print detailed timing once
+    try:
+        for iteration in range(1, NUM_ITERATIONS + 1):
+            start_time = time.time()
+            log_probs_per_env, rewards_per_env, scores, network_time, central_brain_time = run_parallel_episodes(
+                envs, eye, central_layer, readout, decision_interval
+            )
+            elapsed = time.time() - start_time
 
-        total_loss = 0.0
-        episode_total_rewards = []
+            if iteration == 1:
+                eye._debug_timing = False  # only print detailed timing once
 
-        for log_probs, rewards in zip(log_probs_per_env, rewards_per_env):
-            episode_total_rewards.append(sum(rewards))
-            if not log_probs:
-                continue
+            total_loss = 0.0
+            episode_total_rewards = []
 
-            grouped_rewards = [
-                sum(rewards[i:i + decision_interval])
-                for i in range(0, len(rewards), decision_interval)
-            ][:len(log_probs)]
+            for log_probs, rewards in zip(log_probs_per_env, rewards_per_env):
+                episode_total_rewards.append(sum(rewards))
+                if not log_probs:
+                    continue
 
-            returns = compute_discounted_returns(grouped_rewards, GAMMA)
-            for log_prob, ret in zip(log_probs, returns):
-                total_loss -= log_prob * ret
+                grouped_rewards = [
+                    sum(rewards[i:i + decision_interval])
+                    for i in range(0, len(rewards), decision_interval)
+                ][:len(log_probs)]
 
-        optimizer.zero_grad()
-        if isinstance(total_loss, torch.Tensor):
-            total_loss.backward()
-            optimizer.step()
-            loss_value = total_loss.item()
-        else:
-            # No environment made it to a single decision this iteration
-            # (shouldn't normally happen, but safe to skip rather than crash).
-            loss_value = 0.0
+                returns = compute_discounted_returns(grouped_rewards, GAMMA)
+                for log_prob, ret in zip(log_probs, returns):
+                    total_loss -= log_prob * ret
 
-        avg_score = sum(scores) / len(scores)
-        avg_reward = sum(episode_total_rewards) / len(episode_total_rewards)
-        print(
-            f"Iteration {iteration:4d} | avg score: {avg_score:6.2f} | "
-            f"avg reward: {avg_reward:7.2f} | loss: {loss_value:8.3f} | "
-            f"took {elapsed:5.1f}s total (network: {network_time:5.1f}s, "
-            f"central brain: {central_brain_time:5.1f}s)"
-        )
+            optimizer.zero_grad()
+            if isinstance(total_loss, torch.Tensor):
+                total_loss.backward()
+                optimizer.step()
+                loss_value = total_loss.item()
+            else:
+                # No environment made it to a single decision this iteration
+                # (shouldn't normally happen, but safe to skip rather than crash).
+                loss_value = 0.0
 
-    torch.save(readout.state_dict(), SAVE_PATH)
-    print(f"\nSaved trained readout weights to {SAVE_PATH}")
+            avg_score = sum(scores) / len(scores)
+            avg_reward = sum(episode_total_rewards) / len(episode_total_rewards)
+            line = (
+                f"Iteration {iteration:4d} | avg score: {avg_score:6.2f} | "
+                f"avg reward: {avg_reward:7.2f} | loss: {loss_value:8.3f} | "
+                f"took {elapsed:5.1f}s total (network: {network_time:5.1f}s, "
+                f"central brain: {central_brain_time:5.1f}s)"
+            )
+            print(line)
+            log_file.write(line + "\n")
+            log_file.flush()
+
+            if iteration % CHECKPOINT_EVERY == 0:
+                torch.save(readout.state_dict(), SAVE_PATH)
+
+    except KeyboardInterrupt:
+        print("\nInterrupted, saving current weights before exiting...")
+    finally:
+        torch.save(readout.state_dict(), SAVE_PATH)
+        log_file.close()
+        print(f"Saved trained readout weights to {SAVE_PATH}")
 
 
 if __name__ == "__main__":

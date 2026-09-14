@@ -189,6 +189,47 @@ class TetrisEye:
 
         return LayerActivity(responses, self.network.connectome, keepref=True)
 
+    def process_sequence_continuing(self, list_of_sequences, carried_state=None):
+        """
+        Like process_sequence_batch, but supports carrying real network
+        state forward between calls instead of re-running the expensive
+        fade-in warmup every time.
+
+        carried_state: either None (first call in an episode, will run a
+        real fade-in) or the state returned by a previous call to this
+        method, to continue from exactly where the network left off.
+
+        Returns (LayerActivity, new_state). Pass new_state into the next
+        call for the same set of environments, in the same order.
+        """
+        batch_frames = []
+        for sequence in list_of_sequences:
+            frames = [board_to_image(board, piece) for board, piece in sequence]
+            batch_frames.append(np.stack(frames, axis=0))
+
+        batch = np.stack(batch_frames, axis=0)  # (N, n_frames, H, W)
+        frame_tensor = torch.tensor(batch, device=flyvis.device).float()
+        rendered = self.receptors(frame_tensor)  # (N, n_frames, 1, 721)
+
+        if carried_state is None:
+            carried_state = self.network.fade_in_state(FADE_IN_DURATION, DT, rendered[:, 0])
+
+        # Must expand the raw 721-value receptor stimulus into the full
+        # network-wide input tensor (one slot per neuron) before calling
+        # forward directly, this is what simulate() and fade_in_state do
+        # internally via self.stimulus, skipping it causes a shape
+        # mismatch between the receptor count and the full neuron count.
+        batch_size, n_frames = rendered.shape[0], rendered.shape[1]
+        self.network.stimulus.zero(batch_size, n_frames)
+        self.network.stimulus.add_input(rendered)
+        x = self.network.stimulus()
+
+        states_list = self.network(x, DT, state=carried_state, as_states=True)
+        activity = torch.stack([s.nodes.activity for s in states_list], dim=1).cpu()
+        new_state = states_list[-1]
+
+        return LayerActivity(activity, self.network.connectome, keepref=True), new_state
+
 
 if __name__ == "__main__":
     # Quick smoke test: render one empty board frame and print its shape.
